@@ -1,0 +1,4 @@
+- insert:
+    - id: alice-memory
+      name: "dsh-alice-memory"
+      config: {}

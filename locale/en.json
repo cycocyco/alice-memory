@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Alice Memory",
+    "description": "Captures durable facts from conversations and recalls them with hybrid vector + full-text search. Ships remember, recall and forget tools."
+  }
+}
