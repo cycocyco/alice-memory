@@ -29,6 +29,7 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "prepublishOnly": "node --test test/",
     "test": "node --test test/",
     "bench": "node --test test/ --test-name-pattern=bench"
   },
