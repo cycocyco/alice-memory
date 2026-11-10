@@ -260,6 +260,10 @@ lib/recall.mjs     召回 + 超时降级
 lib/heat.mjs       热度与分层
 ```
 
+## 更新日志
+
+每个版本改了什么、升级会自己做什么，都记在 [CHANGELOG.md](./CHANGELOG.md)。装过旧版本的话直接看最新的那条，升级不需要手工跑迁移。
+
 ## License
 
 MIT
