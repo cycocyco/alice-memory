@@ -68,15 +68,19 @@ SILICONFLOW_API_KEY=sk-...
 
 1. **记忆正文会发给你配置的 embedding 服务商。** 向量检索必须先算 embedding，这是这套方案的物理前提。不想让某段内容外发，就用本地模型，或者把 `embedding.url` 指到自己的网关。
 2. **默认带脱敏。** `redact: true` 时，`sk-`、`ghp_`、`github_pat_`、`xoxb-`、`AKIA`、`Bearer`、JWT、长 hex、base64 块、`-----BEGIN ... PRIVATE KEY-----` 会被替换成 `[redacted:xxx]` 再入库。这是兜底，不是保险箱——别指望它挡住所有形态的密钥。
-3. **数据全在你自己的机器上。** 库文件在 `data_dir` 里（`memories.sqlite3` + `vectors.sqlite3`），插件不联网、不上传、不统计。README 和仓库里没有任何数据文件。
+3. **数据全在你自己的机器上。** 库文件在 `data_dir` 里，只有一个 `memories.sqlite3`（正文、向量、墓碑、全文索引同库），插件不联网、不上传、不统计。README 和仓库里没有任何数据文件。
 
 `.gitignore` 已经排除了 `*.sqlite3*`、`config.json`、`.env`——如果你把 `data_dir` 指到仓库里面，记得别手滑 `git add -f`。
 
 ## 数据模型
 
-两个 SQLite 文件，都是 WAL 模式：
+**一个数据目录只有一个库文件**：`<data_dir>/memories.sqlite3`，WAL 模式。正文、向量、墓碑、FTS 全在同一个 SQLite 里。
 
-`memories.sqlite3` — 记忆正文
+不拆两个文件是有意的：拆开之后每写一条记忆就要同时动两个库、两次提交、两套备份；跨库 join（比如清孤儿向量）还得 ATTACH。同库之后写入只有一次事务，孤儿向量一条 SQL 就能扫干净。
+
+老版本（v2 及以前）是 `memories.sqlite3` + `vectors.sqlite3` 两份。升级后第一次启动会自动把向量并进单文件，并把老文件挪进 `<data_dir>/legacy/` 留档——占着文件没挪动成功也没事，下次启动会再来一次，导入是幂等的。
+
+`memories` — 记忆正文
 
 | 列 | 说明 |
 | --- | --- |
@@ -93,7 +97,7 @@ SILICONFLOW_API_KEY=sk-...
 
 `memories_fts` 是 FTS5 trigram 外部内容表，配 `ai/ad/au` 三个触发器跟主表同步。
 
-`vectors.sqlite3` — 向量
+`vectors` — 向量
 
 | 列 | 说明 |
 | --- | --- |
@@ -102,6 +106,8 @@ SILICONFLOW_API_KEY=sk-...
 | `model` / `dimensions` | 防串味 |
 
 `tombstones` 记录删除，保证删掉的记忆不会被 backfill 复活。
+
+`meta` 存 schema 版本、维度、模型、scope——换模型或维度时靠它判断要不要重嵌。
 
 ## 召回流程
 
@@ -150,9 +156,16 @@ alice-memory prune --days 90 --token <t>   # 真删
 alice-memory sweep                         # 立刻跑一次热度分层
 alice-memory backfill                      # 补 pending 向量
 alice-memory export dump.jsonl
+alice-memory migrate --from "D:\old-memory"   # 把散落在别处的旧库并进当前库
+alice-memory migrate --scan W:\TEMP --dry-run # 先看看能扫到哪些库，不写
+alice-memory migrate --scan W:\TEMP --purge   # 导完把只装了库文件的目录一起清掉
 ```
 
+`migrate` 按 `content_sha256` 去重，同 id 冲突改 id，向量按 `memory_id` 只补不覆盖，所以重复跑是安全的。`--purge` 只删「里面除了库文件没别的东西」的目录，混着别的东西一律拒绝。
+
 `--dir` 可以把整套库指到别处试跑，优先级最高（压过环境变量），不会碰你正在用的库。
+
+库开着的时候目录里还会看到 `memories.sqlite3-wal` / `-shm` 两个伴随文件，这是 WAL 模式的正常产物，进程退出后自动收掉，不是第二份数据。
 
 ## 性能
 
@@ -223,10 +236,12 @@ alice-memory export dump.jsonl
 ## 开发
 
 ```bash
-node --test test/     # 11 个用例，约 0.6s，不联网
+node --test test/     # 19 个用例，约 0.8s，不联网
 ```
 
 测试用 `FakeEmbedder`（确定性 hash 向量）代替真模型，所以离线能跑。`test/plugin.test.mjs` 用假 ctx 把插件 `apply()` 跑一遍，验证 hook 注册、注入放行、落库、四个工具都在。
+
+`test/upgrade.test.mjs` 专门守升级路径：手工造出 v2 的双库布局（正文库 + 独立 `vectors.sqlite3`），验证打开即并库、老文件进 `legacy/`、反复启动不产生第二份、维度或模型变了的老向量会被打回 `pending` 等重嵌、老文件是坏文件时也不影响启动。
 
 插件结构：
 
@@ -235,6 +250,7 @@ index.mjs          插件入口：hook 挂载、四个工具、定时器
 cli.mjs            命令行
 lib/config.mjs     配置合并 + 路径与 key 解析
 lib/store.mjs      SQLite：建表、写入、检索、分层、清理
+lib/migrate.mjs    单文件库收束：旧双库并库、散落库导入、目录扫描/清理
 lib/vector-index.mjs  热区连续缓冲 + worker 调度
 lib/vector-worker.mjs worker：热区扫描 + 冷层全库扫
 lib/embedding.mjs  HTTP embedding（可换 Fake）

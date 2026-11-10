@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { Store } from '../lib/store.mjs';
 import { VectorIndex } from '../lib/vector-index.mjs';
@@ -12,6 +13,7 @@ import { captureTurn, isWorthKeeping, loadIndex } from '../lib/capture.mjs';
 import { recallForPrompt } from '../lib/recall.mjs';
 import { remember, forget, prunePreview, pruneApply } from '../lib/ops.mjs';
 import { localDate } from '../lib/text.mjs';
+import { importFromPath, purgeStoreDir } from '../lib/migrate.mjs';
 
 function tmp() {
   const dir = mkdtempSync(join(tmpdir(), 'alice-mem-'));
@@ -54,8 +56,7 @@ function makeCfg(dir, dims = 8) {
       max_user_chars: 2000, max_assistant_chars: 4000,
     },
     files: {
-      memories: join(dir, 'memories.sqlite3'),
-      vectors: join(dir, 'vectors.sqlite3'),
+      db: join(dir, 'memories.sqlite3'),
     },
   };
 }
@@ -317,5 +318,87 @@ test('orphan vectors are pruned', () => {
   } finally {
     store.close();
     cleanup();
+  }
+});
+test('legacy two-file layout folds into the single database', () => {
+  const { dir, cleanup } = tmp();
+  const cfg = makeCfg(dir);
+  let store = openStore(dir, cfg);
+  let a;
+  let b;
+  try {
+    a = store.insertMemory({ content: '第一条记忆：周一要交报告', kind: 'turn', memoryCfg: cfg.memory });
+    b = store.insertMemory({ content: '第二条记忆：周四回访客户', kind: 'turn', memoryCfg: cfg.memory });
+    store.setVector(a.id, hashVector('第一条记忆', 8));
+  } finally {
+    store.close();
+  }
+
+  // 造一个老版本留下的独立向量库
+  const legacy = new DatabaseSync(join(dir, 'vectors.sqlite3'));
+  legacy.exec(`
+    CREATE TABLE vectors (
+      memory_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL, updated_at TEXT NOT NULL, vector BLOB NOT NULL
+    ) STRICT;
+  `);
+  const vec = hashVector('第二条记忆', 8);
+  legacy
+    .prepare('INSERT INTO vectors VALUES (?,?,?,?,?,?)')
+    .run(b.id, 'default', 'fake', 8, new Date().toISOString(), new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength));
+  legacy.close();
+
+  store = openStore(dir, cfg);
+  try {
+    assert.equal(existsSync(join(dir, 'vectors.sqlite3')), false, 'legacy file should be moved away');
+    assert.ok(existsSync(join(dir, 'legacy')), 'legacy backup folder exists');
+    assert.equal(store.countVectors(), 2);
+    assert.equal(store.countAll(), 2);
+    assert.equal(store.getMemory(b.id).embedding_status, 'ok');
+  } finally {
+    store.close();
+    cleanup();
+  }
+});
+
+test('scattered store imports into the unified library and purges cleanly', () => {
+  const target = tmp();
+  const source = tmp();
+  const cfg = makeCfg(target.dir);
+  const srcStore = openStore(source.dir, cfg);
+  try {
+    srcStore.insertMemory({ content: '重复的一条：代理走 127.0.0.1:7890', kind: 'turn', memoryCfg: cfg.memory });
+    const uniq = srcStore.insertMemory({ content: '只在这个散落库里的一条：打印机驱动路径', kind: 'note', memoryCfg: cfg.memory });
+    srcStore.setVector(uniq.id, hashVector('打印机', 8));
+  } finally {
+    srcStore.close();
+  }
+
+  const store = openStore(target.dir, cfg);
+  try {
+    store.insertMemory({ content: '重复的一条：代理走 127.0.0.1:7890', kind: 'turn', memoryCfg: cfg.memory });
+
+    const dry = importFromPath({ db: store.db, path: source.dir, targetScopeId: 'default', dimensions: 8, dryRun: true });
+    assert.equal(dry.ok, true);
+    assert.equal(dry.imported, 1);
+    assert.equal(store.countAll(), 1, 'dry run writes nothing');
+
+    const res = importFromPath({ db: store.db, path: source.dir, targetScopeId: 'default', dimensions: 8 });
+    assert.equal(res.imported, 1);
+    assert.equal(res.duplicates, 1);
+    assert.equal(res.vectors, 1);
+    assert.equal(store.countAll(), 2);
+    assert.equal(store.countVectors(), 1);
+
+    // 目录里还有别的东西时不许整目录删
+    writeFileSync(join(source.dir, 'notes.txt'), 'keep me');
+    assert.equal(purgeStoreDir(source.dir).ok, false);
+    rmSync(join(source.dir, 'notes.txt'));
+    assert.equal(purgeStoreDir(source.dir).ok, true);
+    assert.equal(existsSync(source.dir), false);
+  } finally {
+    store.close();
+    target.cleanup();
+    source.cleanup();
   }
 });

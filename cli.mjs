@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // 命令行：查看状态、手动检索、体检。
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadConfig } from './lib/config.mjs';
+import { DB_NAME, importFromPath, purgeStoreDir, scanStoreDirs } from './lib/migrate.mjs';
 import { createLogger } from './lib/logger.mjs';
 import { Store } from './lib/store.mjs';
 import { VectorIndex } from './lib/vector-index.mjs';
@@ -17,16 +18,21 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv) {
   const out = { _: [] };
+  const put = (key, value) => {
+    if (out[key] === undefined) out[key] = value;
+    else if (Array.isArray(out[key])) out[key].push(value);
+    else out[key] = [out[key], value];
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
       const next = argv[i + 1];
       if (next && !next.startsWith('--')) {
-        out[key] = next;
+        put(key, next);
         i += 1;
       } else {
-        out[key] = true;
+        put(key, true);
       }
     } else {
       out._.push(arg);
@@ -34,6 +40,8 @@ function parseArgs(argv) {
   }
   return out;
 }
+
+const listify = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
 function open(opts = {}) {
   const logger = createLogger(opts.verbose ? 'debug' : 'warn');
@@ -43,7 +51,7 @@ function open(opts = {}) {
     const dir = resolve(opts.dir);
     cfg.dataDir = dir;
     cfg.data_dir = dir;
-    cfg.files = { memories: join(dir, 'memories.sqlite3'), vectors: join(dir, 'vectors.sqlite3') };
+    cfg.files = { db: join(dir, DB_NAME) };
   }
   const store = new Store({
     dataDir: cfg.dataDir,
@@ -74,6 +82,8 @@ async function main() {
   sweep                        立刻跑一次热度分层
   backfill                     补一次缺失的向量
   export <file.jsonl>          导出全部记忆
+  migrate --from <dir|file>    把散落的旧库并进当前库（可重复 --from，或 --scan <root>）
+          [--scan <root>] [--depth n] [--dry-run] [--purge]
   doctor                       环境体检`);
     return;
   }
@@ -85,6 +95,7 @@ async function main() {
       const tiers = store.tierCounts();
       const pending = store.pending(1000).length;
       console.log(`data_dir   ${cfg.dataDir}`);
+      console.log(`db         ${cfg.files.db}${existsSync(cfg.files.db) ? ` (${fmtBytes(statSync(cfg.files.db).size)})` : ' (will be created)'}`);
       console.log(`memories   ${store.countAll()}  (hot ${tiers.hot} / warm ${tiers.warm} / cold ${tiers.cold} / archive ${tiers.archive})`);
       console.log(`vectors    ${store.countVectors()}  (pending ${pending})`);
       console.log(`tombstones ${store.countTombstones()}`);
@@ -154,6 +165,72 @@ async function main() {
       const rows = store.exportAll();
       writeFileSync(file, rows.map((r) => JSON.stringify(r)).join('\n'), 'utf8');
       console.log(`exported ${rows.length} rows → ${file}`);
+      return;
+    }
+
+    if (cmd === 'migrate') {
+      const dryRun = argv['dry-run'] === true || argv.dry === true;
+      const purge = argv.purge === true;
+      const sources = [];
+      for (const from of listify(argv.from)) {
+        const abs = resolve(from);
+        if (!existsSync(abs)) throw new Error(`source not found: ${from}`);
+        sources.push(statSync(abs).isDirectory() ? abs : dirname(abs));
+      }
+      for (const root of listify(argv.scan)) {
+        if (!existsSync(root)) throw new Error(`scan root not found: ${root}`);
+        sources.push(...scanStoreDirs(root, { maxDepth: Number(argv.depth ?? 3) }));
+      }
+      if (!sources.length) {
+        throw new Error('usage: alice-memory migrate --from <dir|file> [--from ...] | --scan <root> [--dry-run] [--purge]');
+      }
+      const selfDir = resolve(cfg.dataDir);
+      const uniq = [...new Set(sources.map((d) => resolve(d)))].filter((d) => d !== selfDir);
+      if (!uniq.length) {
+        console.log('nothing to migrate — the only store found is the target itself');
+        return;
+      }
+      const totals = { imported: 0, duplicates: 0, vectors: 0, purged: 0, errors: 0 };
+      for (const dir of uniq) {
+        const res = importFromPath({
+          db: store.db,
+          path: dir,
+          targetScopeId: cfg.scope_id,
+          dimensions: cfg.embedding.dimensions,
+          dryRun,
+          logger,
+        });
+        if (!res.ok) {
+          totals.errors += 1;
+          console.log(`skip  ${dir}  (${res.error})`);
+          continue;
+        }
+        totals.imported += res.imported;
+        totals.duplicates += res.duplicates;
+        totals.vectors += res.vectors;
+        totals.errors += res.errors.length;
+        const extra = [
+          res.scopeRemapped ? `scope→${cfg.scope_id}×${res.scopeRemapped}` : '',
+          res.vectorsSkipped ? `向量跳过 ${res.vectorsSkipped}` : '',
+        ].filter(Boolean).join(', ');
+        console.log(
+          `${dryRun ? 'plan' : 'pull'}  ${dir}  正文 +${res.imported} / 已在库 ${res.duplicates} / 向量 +${res.vectors}${extra ? `  (${extra})` : ''}`,
+        );
+        if (purge && !dryRun) {
+          const out = purgeStoreDir(dir);
+          if (out.ok) {
+            totals.purged += 1;
+            console.log(`clean ${dir}`);
+          } else {
+            console.log(`keep  ${dir}  (${out.error})`);
+          }
+        }
+      }
+      const orphans = dryRun ? 0 : store.pruneOrphanVectors();
+      console.log(
+        `${dryRun ? 'dry-run' : 'done'}: 正文 +${totals.imported}，向量 +${totals.vectors}，重复跳过 ${totals.duplicates}，清目录 ${totals.purged}` +
+          `${orphans ? `，孤儿向量 -${orphans}` : ''}${totals.errors ? `，错误 ${totals.errors}` : ''}`,
+      );
       return;
     }
 
