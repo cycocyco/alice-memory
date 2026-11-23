@@ -13,7 +13,8 @@ import { captureTurn, isWorthKeeping, loadIndex } from '../lib/capture.mjs';
 import { recallForPrompt } from '../lib/recall.mjs';
 import { remember, forget, prunePreview, pruneApply, listEntries, forgetMany, mergeMemories } from '../lib/ops.mjs';
 import { tidyScan, cosine, isShell, clusterBySimilarity, readAnchor, writeAnchor } from '../lib/tidy.mjs';
-import { localDate } from '../lib/text.mjs';
+import { localDate, queryTerms } from '../lib/text.mjs';
+import { assignTiers } from '../lib/heat.mjs';
 import { importFromPath, purgeStoreDir } from '../lib/migrate.mjs';
 
 function tmp() {
@@ -84,6 +85,35 @@ test('insert dedupes by content hash and lands in FTS', () => {
   } finally {
     store.close();
     cleanup();
+  }
+});
+
+test('queryTerms 丢掉问句脚手架词，保住内容词', () => {
+  assert.deepEqual(queryTerms('Python 的 GIL 是什么'), ['Python', 'GIL']);
+  assert.deepEqual(queryTerms('怎么样'), []);
+  // 标识符这类短而独特的词不能被当脚手架扔掉
+  assert.deepEqual(queryTerms('0x80070005 怎么解决'), ['0x80070005', '怎么解决']);
+});
+
+test('自适应分层：100 条也有 100 条的冷热，不按绝对容量', () => {
+  const items = Array.from({ length: 100 }, (_, i) => ({
+    id: `m${i}`, heat: 3 - i * 0.01, pinned: false, prev: 'hot',
+  }));
+  const out = assignTiers(items, { hot_ratio: 0.2, warm_ratio: 0.3 });
+  const count = (t) => out.filter((x) => x.tier === t).length;
+  assert.equal(count('hot'), 20);
+  assert.equal(count('warm'), 30);
+  assert.equal(count('cold'), 50);
+});
+
+test('自适应分层随库规模缩放：10 条和 1000 条都切出同样的比例', () => {
+  const mk = (n) => Array.from({ length: n }, (_, i) => ({
+    id: `m${i}`, heat: 3 - (i * 3) / n, pinned: false, prev: 'hot',
+  }));
+  for (const n of [10, 1000]) {
+    const out = assignTiers(mk(n), { hot_ratio: 0.2, warm_ratio: 0.3 });
+    const hot = out.filter((x) => x.tier === 'hot').length;
+    assert.ok(Math.abs(hot - n * 0.2) <= 1, `${n} 条的 hot 数 ${hot} 偏离 20%`);
   }
 });
 
